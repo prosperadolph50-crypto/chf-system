@@ -10,3 +10,6 @@ a2wsgi
 psycopg2-binary
 sqlalchemy
 gunicorn
+
+flask
+flask-cors
