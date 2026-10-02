@@ -1,238 +1,250 @@
-from fastapi import FastAPI, Query, Body, HTTPException, UploadFile, File
-from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse
+import psycopg2
+import psycopg2.extras
 import pandas as pd
 import math
 import os
+from flask import Flask, request, jsonify, send_file
+from flask_cors import CORS
+from sqlalchemy import create_engine
 
-app = FastAPI()
+app = Flask(__name__)
+CORS(app)
 
-# Allow CORS for React frontend
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
+# Use Render environment variable for DB, fallback to Neon connection string
+DB_URL = os.environ.get("DATABASE_URL", "postgresql://neondb_owner:npg_HAOrfQjd8Ke1@ep-young-haze-b5krg0wi-pooler.c-7.us-east-2.aws.neon.tech/neondb?sslmode=require")
 
-DATA_FILE_PATH = os.path.join(os.path.dirname(os.path.dirname(__file__)), 'member_data_cleaned_final.xlsx')
+FRONTEND_DIR = os.path.join(os.path.dirname(os.path.dirname(__file__)), 'frontend')
 
-def load_data():
-    print(f"Loading data from {DATA_FILE_PATH}...")
-    try:
-        try:
-            df = pd.read_excel(DATA_FILE_PATH, engine='calamine')
-        except Exception:
-            df = pd.read_excel(DATA_FILE_PATH)
-            
-        # Convert to object to allow empty strings, then fillna
-        df = df.astype(object).fillna("")
-        
-        # Super fast vectorized cleaning
-        for col in df.columns:
-            df[col] = df[col].astype(str).str.replace(r'\.0$', '', regex=True).str.replace(' 00:00:00', '', regex=False)
-            
-        df['_search_col'] = df[df.columns[0]].str.cat(df[df.columns[1:]], sep=' ').str.lower()
-        print("Data loaded successfully.")
-        return df
-    except Exception as e:
-        print(f"Error loading data: {e}")
-        return pd.DataFrame()
+def get_db():
+    conn = psycopg2.connect(DB_URL)
+    return conn
 
-df = load_data()
+@app.route("/")
+def serve_frontend():
+    index_path = os.path.join(FRONTEND_DIR, 'index.html')
+    if os.path.exists(index_path):
+        with open(index_path, 'r', encoding='utf-8') as f:
+            return f.read()
+    return jsonify({"status": "Backend is running, but frontend not found."})
 
-def save_data():
-    global df
-    print("Saving data to excel safely...")
-    export_df = df.drop(columns=['_search_col'])
+@app.route("/api/login", methods=["POST"])
+def login():
+    data = request.json
+    username = data.get("username")
+    password = data.get("password")
     
-    temp_path = DATA_FILE_PATH.replace('.xlsx', '_temp.xlsx')
-    export_df.to_excel(temp_path, index=False, engine='openpyxl')
+    if username == "prosper.kashaga" and password == "Ruthmsechu@822":
+        return jsonify({"status": "success", "token": "fake-jwt-123"})
+    else:
+        return jsonify({"status": "error", "detail": "Jina au Password sio sahihi"}), 401
+
+@app.route("/api/members", methods=["GET"])
+def search_members():
+    query = request.args.get("query", "")
+    page = int(request.args.get("page", 1))
+    page_size = int(request.args.get("page_size", 50))
     
-    if os.path.exists(DATA_FILE_PATH):
-        backup_path = DATA_FILE_PATH.replace('.xlsx', '_backup.xlsx')
-        if os.path.exists(backup_path):
-            os.remove(backup_path)
-        os.rename(DATA_FILE_PATH, backup_path)
-        
-    os.rename(temp_path, DATA_FILE_PATH)
-    print("Data saved.")
-
-@app.get("/")
-def index():
-    return {"status": "Backend is running"}
-
-@app.get("/reload")
-def reload_excel_data():
-    global df
-    df = load_data()
-    return {"status": "success", "message": "Data reloaded successfully from Excel!"}
-
-@app.get("/members")
-def search_members(
-    query: str = Query("", description="Search term across all columns"),
-    page: int = Query(1, ge=1),
-    page_size: int = Query(50, ge=1, le=1000)
-):
-    if df.empty:
-        return {"error": "Data file not found or empty"}
-
-    filtered_df = df
+    conn = get_db()
+    c = conn.cursor(cursor_factory=psycopg2.extras.DictCursor)
+    
+    where_clause = ""
+    params = []
+    
     if query:
-        # Use the optimized search column
-        mask = filtered_df['_search_col'].str.contains(query.lower(), na=False)
-        filtered_df = filtered_df[mask]
-    
-    total_records = len(filtered_df)
+        where_clause = "WHERE _search_col LIKE %s"
+        params.append(f"%{query.lower()}%")
+        
+    c.execute(f"SELECT COUNT(*) as cnt FROM members {where_clause}", params)
+    total_records = c.fetchone()['cnt']
     total_pages = math.ceil(total_records / page_size) if total_records > 0 else 1
     
-    # Pagination
-    start_idx = (page - 1) * page_size
-    end_idx = start_idx + page_size
+    offset = (page - 1) * page_size
     
-    paginated_df = filtered_df.iloc[start_idx:end_idx].copy()
-    paginated_df['_id'] = paginated_df.index # Give frontend the true row index
-    paginated_df = paginated_df.drop(columns=['_search_col'])
+    query_sql = f"SELECT * FROM members {where_clause} ORDER BY _id DESC LIMIT %s OFFSET %s"
+    params.extend([page_size, offset])
     
-    records = paginated_df.to_dict(orient="records")
+    c.execute(query_sql, params)
+    rows = c.fetchall()
     
-    return {
+    records = []
+    for row in rows:
+        r = dict(row)
+        r.pop('_search_col', None)
+        records.append(r)
+        
+    conn.close()
+    
+    return jsonify({
         "total_records": total_records,
         "total_pages": total_pages,
         "current_page": page,
         "page_size": page_size,
         "data": records
-    }
+    })
 
-@app.post("/members")
-def add_member(member: dict = Body(...)):
-    global df
-    new_idx = len(df)
+@app.route("/api/members", methods=["POST"])
+def add_member():
+    member = request.json
+    conn = get_db()
+    c = conn.cursor()
     
-    new_row = {}
-    for col in df.columns:
-        if col != '_search_col':
-            new_row[col] = str(member.get(col, ""))
+    cols = []
+    vals = []
+    search_parts = []
+    
+    for key, value in member.items():
+        if key not in ('_search_col', '_id', 'index'):
+            cols.append(f'"{key}"')
+            val_str = str(value)
+            vals.append(val_str)
+            search_parts.append(val_str)
             
-    df.loc[new_idx] = new_row
-    df.at[new_idx, '_search_col'] = ' '.join(df.loc[new_idx].drop('_search_col').values).lower()
+    search_col = " ".join(search_parts).lower()
+    cols.append('"_search_col"')
+    vals.append(search_col)
     
-    save_data()
-    return {"status": "success", "message": "Member added successfully"}
+    placeholders = ",".join(["%s"] * len(vals))
+    col_str = ",".join(cols)
+    
+    c.execute(f"INSERT INTO members ({col_str}) VALUES ({placeholders})", vals)
+    conn.commit()
+    conn.close()
+    
+    return jsonify({"status": "success", "message": "Member added successfully"})
 
-@app.put("/members/{member_id}")
-def edit_member(member_id: int, member: dict = Body(...)):
-    global df
-    if member_id not in df.index:
-        raise HTTPException(status_code=404, detail="Member not found")
-        
-    old_row = df.loc[member_id].to_dict()
-    new_idx = len(df)
+@app.route("/api/members/<int:member_id>", methods=["PUT"])
+def edit_member(member_id):
+    member = request.json
+    conn = get_db()
+    c = conn.cursor(cursor_factory=psycopg2.extras.DictCursor)
     
-    new_row = {}
-    for col in df.columns:
-        if col != '_search_col':
-            if col in member:
-                new_row[col] = str(member[col])
+    c.execute("SELECT * FROM members WHERE _id = %s", (member_id,))
+    old_row = c.fetchone()
+    if not old_row:
+        conn.close()
+        return jsonify({"detail": "Member not found"}), 404
+        
+    old_dict = dict(old_row)
+    
+    cols = []
+    vals = []
+    search_parts = []
+    
+    for key in old_dict.keys():
+        if key not in ('_search_col', '_id', 'index'):
+            cols.append(f'"{key}"')
+            
+            if key in member:
+                val_str = str(member[key])
             else:
-                new_row[col] = old_row.get(col, "")
+                val_str = str(old_dict[key])
                 
-    # Add as a new record at the bottom
-    df.loc[new_idx] = new_row
-    
-    # Re-calculate search column for the new row
-    df.at[new_idx, '_search_col'] = ' '.join(df.loc[new_idx].drop('_search_col').values).lower()
-    
-    save_data()
-    return {"status": "success", "message": "Member edited and added as a new record successfully"}
-
-@app.delete("/members/{member_id}")
-def delete_member(member_id: int):
-    global df
-    if member_id not in df.index:
-        return {"status": "success", "message": "Member already deleted"}
-        
-    df.drop(index=member_id, inplace=True)
-    save_data()
-    return {"status": "success", "message": "Member deleted successfully"}
-
-@app.post("/upload")
-def upload_excel(file: UploadFile = File(...)):
-    global df
-    try:
-        # Save uploaded file to temp
-        temp_file = "temp_uploaded.xlsx"
-        with open(temp_file, "wb") as f:
-            f.write(file.file.read())
+            vals.append(val_str)
+            search_parts.append(val_str)
             
-        # Read the new data
+    search_col = " ".join(search_parts).lower()
+    cols.append('"_search_col"')
+    vals.append(search_col)
+    
+    placeholders = ",".join(["%s"] * len(vals))
+    col_str = ",".join(cols)
+    
+    # We insert it as a new row
+    c.execute(f"INSERT INTO members ({col_str}) VALUES ({placeholders})", vals)
+    conn.commit()
+    conn.close()
+    
+    return jsonify({"status": "success", "message": "Member edited and added as a new record successfully"})
+
+@app.route("/api/members/<int:member_id>", methods=["DELETE"])
+def delete_member(member_id):
+    conn = get_db()
+    c = conn.cursor()
+    c.execute("DELETE FROM members WHERE _id = %s", (member_id,))
+    conn.commit()
+    conn.close()
+    return jsonify({"status": "success", "message": "Member deleted successfully"})
+
+@app.route("/api/upload", methods=["POST"])
+def upload_excel():
+    if 'file' not in request.files:
+        return jsonify({"detail": "No file part"}), 400
+    file = request.files['file']
+    if file.filename == '':
+        return jsonify({"detail": "No selected file"}), 400
+        
+    try:
+        temp_file = "temp_uploaded.xlsx"
+        file.save(temp_file)
+            
         try:
             new_df = pd.read_excel(temp_file, engine='calamine')
         except Exception:
             new_df = pd.read_excel(temp_file)
             
-        # Convert to object to allow empty strings, then fillna
         new_df = new_df.astype(object).fillna("")
-        
-        # Super fast vectorized cleaning
         for col in new_df.columns:
             new_df[col] = new_df[col].astype(str).str.replace(r'\.0$', '', regex=True).str.replace(' 00:00:00', '', regex=False)
             
-        # Add search_col if it doesn't exist
         if '_search_col' not in new_df.columns:
             new_df['_search_col'] = new_df[new_df.columns[0]].str.cat(new_df[new_df.columns[1:]], sep=' ').str.lower()
             
-        # Append to existing
-        # Ignore index to add them at the bottom
-        df = pd.concat([df, new_df], ignore_index=True)
+        # Write to Postgres
+        # We need SQLAlchemy engine for pandas to_sql
+        engine = create_engine(DB_URL.replace("postgres://", "postgresql://").replace("postgresql://", "postgresql+psycopg2://"))
         
-        # Fill any NaNs created by missing columns in new_df
-        df = df.astype(object).fillna("")
-        # Make sure they're strings
-        for col in df.columns:
-            df[col] = df[col].astype(str).str.replace(r'\.0$', '', regex=True)
-                
-        # Save to disk
-        save_data()
+        # We don't include _id column if it's missing, PostgreSQL SERIAL will handle it.
+        # However, to_sql replaces by default if we don't specify if_exists='append'
+        new_df.to_sql('members', engine, if_exists='append', index=False, chunksize=1000)
         
-        # Clean up temp file
         if os.path.exists(temp_file):
             os.remove(temp_file)
             
-        return {"status": "success", "message": f"{len(new_df)} members uploaded successfully!"}
+        return jsonify({"status": "success", "message": f"{len(new_df)} members uploaded successfully!"})
     except Exception as e:
         print(f"Error uploading file: {e}")
-        raise HTTPException(status_code=500, detail=str(e))
+        return jsonify({"detail": str(e)}), 500
 
-@app.get("/template")
+@app.route("/api/template", methods=["GET"])
 def download_template():
-    # Exclude internal columns
-    export_cols = [c for c in df.columns if c != '_search_col']
-    template_df = pd.DataFrame(columns=export_cols)
+    conn = get_db()
+    c = conn.cursor(cursor_factory=psycopg2.extras.DictCursor)
+    c.execute("SELECT * FROM members LIMIT 1")
+    row = c.fetchone()
+    conn.close()
+    
+    if not row:
+        return jsonify({"detail": "No columns found"}), 404
+        
+    cols = [key for key in dict(row).keys() if key not in ('_id', 'index', '_search_col')]
+    
+    template_df = pd.DataFrame(columns=cols)
     temp_file = "template.xlsx"
     template_df.to_excel(temp_file, index=False, engine='openpyxl')
-    return FileResponse(temp_file, filename="Member_Template.xlsx")
+    return send_file(temp_file, as_attachment=True, download_name="Member_Template.xlsx")
 
-
-
-@app.get("/download")
-def download_excel(query: str = Query("")):
-    if df.empty:
-        return {"error": "Data file not found or empty"}
-
-    filtered_df = df
-    if query:
-        mask = filtered_df['_search_col'].str.contains(query.lower(), na=False)
-        filtered_df = filtered_df[mask]
+@app.route("/api/download", methods=["GET"])
+def download_excel():
+    query = request.args.get("query", "")
     
-    export_df = filtered_df.drop(columns=['_search_col'])
+    where_clause = ""
+    params = []
+    
+    if query:
+        where_clause = "WHERE _search_col LIKE %s"
+        params.append(f"%{query.lower()}%")
+        
+    # Pandas read_sql_query supports SQLAlchemy engines, which is safer
+    engine = create_engine(DB_URL.replace("postgres://", "postgresql://").replace("postgresql://", "postgresql+psycopg2://"))
+    df = pd.read_sql_query(f"SELECT * FROM members {where_clause}", engine, params=params)
+    
+    cols_to_drop = [c for c in ['_id', 'index', '_search_col'] if c in df.columns]
+    df = df.drop(columns=cols_to_drop)
     
     temp_file = "filtered_results.xlsx"
-    export_df.to_excel(temp_file, index=False)
+    df.to_excel(temp_file, index=False, engine='openpyxl')
     
-    return FileResponse(
-        temp_file,
-        media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-        filename="members_search_results.xlsx"
-    )
+    return send_file(temp_file, as_attachment=True, download_name="members_search_results.xlsx", mimetype="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
+
+if __name__ == "__main__":
+    app.run(port=8000, debug=True)

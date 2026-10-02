@@ -21,6 +21,8 @@
         const ALL_COLUMNS = ['SN', 'memberNo', 'FullNames', 'DOB', 'SEX', 'Expirydate', 'registrationdate', 'status', 'payroll number', 'employmenttype', 'spouseAddress', 'relationship'];
 
         function App() {
+            
+
             const [query, setQuery] = useState("");
             const [members, setMembers] = useState([]);
             const [page, setPage] = useState(1);
@@ -37,7 +39,10 @@
             const [confirmDialog, setConfirmDialog] = useState({ isOpen: false, memberId: null, title: "", message: "" });
             const [alertDialog, setAlertDialog] = useState({ isOpen: false, title: "", message: "", type: "success" });
 
-            const API_BASE = "http://127.0.0.1:8000";
+            // Dynamic API Base to support both offline file:// and online hosting
+        const API_BASE = window.location.protocol === 'file:' || window.location.hostname === '127.0.0.1' || window.location.hostname === 'localhost'
+            ? "http://127.0.0.1:8000/api" 
+            : window.location.origin + "/api";
 
             const fetchMembers = async (searchQuery, pageNum) => {
                 setLoading(true);
@@ -210,9 +215,15 @@
                 }
             };
 
+            
+            
+
             return (
+
                 <div className="container mx-auto p-4">
-                    <h1 className="text-3xl font-bold mb-6 text-center text-blue-600">CHF Members System</h1>
+                    
+<h1 className="text-3xl font-bold mb-6 text-center text-blue-600">CHF Members System</h1>
+
                     
                     <div className="bg-white p-6 rounded-lg shadow-md mb-6">
                         <form onSubmit={handleSearch} className="flex gap-4 mb-4">

@@ -1,5 +1,12 @@
-fastapi
-uvicorn
-pandas
-openpyxl
-pydantic
+fastapi==0.142.2
+openpyxl==3.1.5
+pandas==3.0.5
+python-calamine==0.8.2
+uvicorn==0.53.0
+python-multipart
+
+a2wsgi
+
+psycopg2-binary
+sqlalchemy
+gunicorn
